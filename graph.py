@@ -17,9 +17,12 @@ class CovarianceMetric():
     
     def update(self, batch_size, *feats, **aux_params):
         # jitter the second element in feats
+        feats = list(feats)
         assert len(feats) == 2
         feats[1] += torch.randn_like(feats[1])
+        print(f"Feats (original) shape: {feats[0].shape}")
         feats = torch.cat(feats, dim=0)
+        print(f"Feats shape: {feats.shape}")
         feats = torch.nan_to_num(feats, 0, 0, 0)
         
         std = feats.std(dim=1)
@@ -35,6 +38,7 @@ class CovarianceMetric():
         self.std   += std   * batch_size
     
     def finalize(self, numel, eps=1e-4):
+        print("Finalizing covariance...")
         self.outer /= numel
         self.mean  /= numel
         self.std   /= numel
@@ -42,7 +46,8 @@ class CovarianceMetric():
         if torch.isnan(cov).any():
             breakpoint()
         if (torch.diagonal(cov) < 0).sum():
-            pdb.set_trace()
+            print("Negative diagonal in covariance matrix. Adding epsilon.")
+            #pdb.set_trace()
         return cov
 
 def match_tensors_zipit(
@@ -239,6 +244,7 @@ class Node:
         self.param_name = param_name
         self.chunk = chunk
         self.special_merge = special_merge
+        self.color = None
 
     def __str__(self):
         return f"Node({self.name}, {self.type}, {self.layer_name}, {self.param_name}, {self.chunk}, {self.special_merge})"
@@ -263,6 +269,10 @@ class Graph:
         self.nodes.append(node)
         self.edges[node] = []
 
+    def decolor(self):
+        for node in self.nodes:
+            node.color = None
+
     def add_edge(self, node1, node2):
         self.edges[node1].append(node2)
 
@@ -284,21 +294,27 @@ class Graph:
 
         for node in self.nodes:
             name = node.name
+
+            t = (node.name, node.layer_name)
+            color = {}
             if node.type == NodeType.MODULE:
-                dot.node(node.name, node.layer_name)
+                pass
             elif node.type == NodeType.PREFIX:
-                dot.node(node.name, "Prefix")
+                t = (node.name, "Prefix")
             elif node.type == NodeType.POSTFIX:
-                dot.node(node.name, "Postfix")
+                t = (node.name, "Postfix")
             elif node.type == NodeType.SUM:
-                dot.node(node.name, "Sum")
+                t = (node.name, "Sum")
             else:
-                dot.node(node.name, node.name)
+                t = (node.name, node.name)
+            if node.color is not None:
+                color = {'color': node.color, 'style': 'filled'}
+            print(f"Adding node {t} with color {color}")
+            dot.node(*t, **color)
         for n in self.edges:
             for succ in self.edges[n]:
                 dot.edge(n.name, succ.name)
         return dot
-
 
 
 class ModelGraph(ABC):
@@ -312,8 +328,8 @@ class ModelGraph(ABC):
         self.hooks = []
         self.intermediates = {} # layer to activations
 
-        self.merged = {}
-        self.unmerged = {}
+        self.merged = set()
+        self.unmerged = set()
 
     def reset_graph(self):
         self.G = Graph()
@@ -366,12 +382,12 @@ class ModelGraph(ABC):
             if node.type in [NodeType.PREFIX, NodeType.POSTFIX]:
                 print(f"{node.name} in={len(self.preds(node))} out={len(self.succs(node))}")
 
-    def hook_fn(self, name):
+    def hook_fn(self, node):
         def hook(module, input, _):
             a = FeatureReshapeHandler(module.__class__.__name__, module)
             b = a.handler(input[0])
-            self.intermediates[name] = b
-            print(f"Hooked {name} with shape {b.shape}")
+            self.intermediates[node] = b
+            print(f"Hooked {node.name} with shape {b.shape}")
             return None
         return hook
 
@@ -379,14 +395,14 @@ class ModelGraph(ABC):
         self.clear_hooks()
 
         for node in self.G.nodes:
-            if node.type == NodeType.PREFIX:
+            if node.type == NodeType.PREFIX or node.type == NodeType.SUM:
 
                 for succ in self.succs(node):
                     print(f"Trying {succ.layer_name} with type {succ.type}")
 
                     if succ.type == NodeType.MODULE:
                         # add it to the first module
-                        self.hooks.append(self.named_modules[succ.layer_name].register_forward_hook(self.hook_fn(succ.layer_name)))
+                        self.hooks.append(self.named_modules[succ.layer_name].register_forward_hook(self.hook_fn(node)))
                         break
                 else:
                     raise RuntimeError(f"Node type {node.type} not supported for prefix hooks")
@@ -513,13 +529,203 @@ class Resnet(ModelGraph):
         for i in range(1, self.num_layers + 1):
             input_node = self.add_layer_nodes(self.layer_name + str(i), input_node)
 
-        input_node = self.add_nodes_from_sequence('', [NodeType.PREFIX, 'avgpool', self.head_name, NodeType.OUTPUT], input_node, sep='')
+        input_node = self.add_nodes_from_sequence('', ['avgpool', self.head_name, NodeType.OUTPUT], input_node, sep='')
 
 
         return self
 
 def resnet50(model):
     return Resnet(model, shortcut_name='downsample', head_name='fc', num_layers=4)
+
+
+class MergeHandler:
+    """ 
+    Handles all (un)merge transformations on top of a graph architecture. merge/unmerge is a dict whose 
+    keys are graph nodes and values are merges/unmerges to be applied at the graph node.
+    """
+    def __init__(self, graph, merge, unmerge):
+        self.graph = graph
+        # (Un)Merge instructions for different kinds of module layers.
+        self.module_handlers = {
+            'BatchNorm2d': self.handle_batchnorm2d,
+            'Conv2d': self.handle_conv2d,
+            'Linear': self.handle_linear,
+            'LayerNorm': self.handle_layernorm,
+            'GELU': self.handle_fn, #most likely will not be used
+            'AdaptiveAvgPool2d': self.handle_fn,
+            'LeakyReLU': self.handle_fn, #most likely will not be used
+            'ReLU': self.handle_fn, #most likely will not be used
+            'Tanh': self.handle_fn, #most likely will not be used
+            'MaxPool2d': self.handle_fn,
+            'AvgPool2d': self.handle_fn,
+            'SpaceInterceptor': self.handle_linear, #most likely will not be used
+            'Identity': self.handle_fn #most likely will not be used
+        }
+
+        self.merge = merge
+        self.unmerge = unmerge
+    
+    def handle_batchnorm2d(self, forward, node, module):
+        """ Apply (un)merge operation to batchnorm parameters. """
+        if forward:
+            # Forward will always be called on a batchnorm, but backward might not be called
+            # So merge the batch norm here.
+            #for parameter_name in ['weight', 'bias', 'running_mean', 'running_var']:
+            #    parameter = getattr(module, parameter_name)
+            #    merge = self.merge if parameter_name != 'running_var' else self.merge # ** 2
+            #    parameter.data = merge @ parameter
+
+            node.color = 'yellow'
+            
+            for succ in self.graph.succs(node):
+                self.prop_forward(succ)
+        else:
+            assert len(self.graph.preds(node)) == 1, 'BN expects one predecessor'
+            self.prop_back(self.graph.preds(node)[0])
+    
+    def handle_layernorm(self, forward, node, module):
+        """ Apply (un)merge operation to layernorm parameters. """
+        if forward:
+            # Forward will always be called on a norm, so merge here
+            parameter_names = ['weight', 'bias']
+            #for parameter_name in parameter_names:
+            #    parameter = getattr(module, parameter_name)
+            #    parameter.data = self.merge @ parameter
+
+            node.color = 'yellow'
+            
+            for succ in self.graph.succs(node):
+                self.prop_forward(succ)
+        else:
+            assert len(self.graph.preds(node)) == 1, 'LN expects one predecessor'
+            self.prop_back(self.graph.preds(node)[0])
+
+    def handle_fn(self, forward, node, module):
+        """ Apply (un)merge operation to parameterless layers. """
+        node.color = 'yellow'
+        if forward:
+            for succ in self.graph.succs(node):
+                self.prop_forward(succ)
+        else:
+            assert len(self.graph.preds(node)) == 1, 'Function node expects one predecessor'
+            self.prop_back(self.graph.preds(node)[0])
+
+    def handle_conv2d(self, forward, node, module):
+        """ Apply (un)merge operation to linear layer parameters. """
+        if forward: # unmerge
+            try:
+                #module.weight.data = torch.einsum('OIHW,IU->OUHW', module.weight, self.unmerge)
+                pass
+            except:
+                pdb.set_trace()
+        else: # merge
+            #try:
+            #    #module.weight.data = torch.einsum('UO,OIHW->UIHW', self.merge, module.weight)
+            #except:
+            #    pdb.set_trace()
+            #if hasattr(module, 'bias') and module.bias is not None:
+            #    module.bias.data = self.merge @ module.bias
+            pass
+        node.color = 'green'
+    
+    def handle_linear(self, forward, node, module):
+        """ Apply (un)merge operation to linear layer parameters. """
+        if forward: # unmerge
+            #module.weight.data = module.weight @ self.unmerge
+            pass
+        else:
+            info = self.graph.get_node_info(node)
+
+            lower = 0
+            upper = module.weight.shape[0]
+
+            #if info['chunk'] is not None:
+            #    idx, num_chunks = info['chunk']
+            #    chunk_size = upper // num_chunks
+
+            #    lower = idx * chunk_size
+            #    upper = (idx+1) * chunk_size
+
+            #module.weight.data[lower:upper] = self.merge @ module.weight[lower:upper]
+            #if hasattr(module, 'bias') and module.bias is not None:
+            #    module.bias.data[lower:upper] = self.merge @ module.bias[lower:upper]
+        node.color = 'green'
+
+    def prop_back(self, node):
+        """ Propogate (un)merge metrics backwards through a node graph. """
+        if node in self.graph.merged:
+            #node.color = 'blue'
+            print("Collision")
+            return
+        
+        #info = h.get_node_info(node)
+        self.graph.merged.add(node)
+        
+        for succ in self.graph.succs(node):
+            self.prop_forward(succ)
+        
+        if node.type in (NodeType.OUTPUT, NodeType.INPUT):
+            raise RuntimeError(f'Unexpectedly reached node type {node.type} when merging.')
+        elif node.type == NodeType.CONCAT:
+            # Also this only works if you concat the same size things together
+            merge = self.merge.chunk(len(self.graph.preds(node)), dim=1)
+            for pred, m in zip(self.graph.preds(node), merge):
+                MergeHandler(self.graph, m, self.unmerge).prop_back(pred)
+        elif node.type == NodeType.MODULE:
+            module = self.graph.get_module(node.layer_name)
+            # try:
+            self.module_handlers[module.__class__.__name__](False, node, module)
+            # except:
+            #     pdb.set_trace()
+        elif node.type == NodeType.EMBEDDING:
+            param = self.graph.get_parameter(node.param)
+            self.handle_embedding(False, node, param)
+        else:
+            # Default case (also for SUM)
+            for pred in self.graph.preds(node):
+                self.prop_back(pred)
+    
+    def prop_forward(self, node):
+        """ Propogate (un)merge transformations up a network graph. """
+        if node in self.graph.unmerged:
+            # node.color = 'blue'
+            print("Collision")
+            return
+        
+        #info = self.graph.get_node_info(node)
+        self.graph.unmerged.add(node)
+        
+        if node.type in (NodeType.OUTPUT, NodeType.INPUT):
+            raise RuntimeError(f'Unexpectedly reached node type {node.type} when unmerging.')
+        elif node.type == NodeType.MODULE:
+            module = self.graph.get_module(node.layer_name)
+            self.module_handlers[module.__class__.__name__](True, node, module)
+        elif node.type == NodeType.SUM:
+            for succ in self.graph.succs(node):
+                self.prop_forward(succ)
+            for pred in self.graph.preds(node):
+                self.prop_back(pred)
+        elif node.type == NodeType.CONCAT:
+            # let's make the assumption that this node is reached in the correct order
+            num_to_concat = len(self.graph.preds(node))
+
+            if node not in self.graph.working_info:
+                self.graph.working_info[node] = []
+            self.graph.working_info[node].append(self.unmerge)
+            
+            if len(self.graph.working_info[node]) < num_to_concat:
+                # haven't collected all the info yet, don't finish the unmerge
+                self.graph.unmerged.remove(node) 
+            else: # finally, we're finished
+                unmerge = torch.block_diag(*self.graph.working_info[node])
+                del self.graph.working_info[node]
+
+                # be free my little unmerge
+                new_handler = MergeHandler(self.graph, self.merge, unmerge)
+                for succ in self.graph.succs(node):
+                    new_handler.prop_forward(succ)
+
+
 
 if __name__ == '__main__':
     import torch
@@ -540,21 +746,32 @@ if __name__ == '__main__':
     graph.add_hooks()
 
     intermediates = graph.compute_intermediates(data_x)
-    #intermediates = {k: [v,v] for k,v in intermediates.items()}
 
-    metric = CovarianceMetric()
+    #for k, v in intermediates.items():
+    #    metric = CovarianceMetric()
+    #    metric.update(1, v, v)
+    #    m = {"covariance": metric.finalize(1)}
+    #    merge, unmerge = match_tensors_zipit(m, r=.5, a=0.3, b=.125)
+    #    del m
+    #    del metric
 
-    for k, v in intermediates.items():
-        metric.update(1, [v, v])
-        print(f"{k}: {metric.finalize(1).shape}")
+    #    print(f"Merge shape: {merge.shape}")
+    #    print(f"Unmerge shape: {unmerge.shape}")
 
+    merges, unmerges = intermediates, intermediates
 
+    for i, node in enumerate(list(merges.keys())[:4]):
+        m_ = merges[node]
+        u_ = unmerges[node]
+        merger = MergeHandler(graph, m_, u_)
+        node.color = 'red'
+        merger.prop_back(node)
+        diagram = graph.G.draw()
+        diagram.render(f'resnet50_{i}', format='png')
+        graph.G.decolor()
+        
 
-
-
-
-    #diagram = graph.G.draw()
-    #diagram.render('resnet50', format='png')
+    
     
 
 
