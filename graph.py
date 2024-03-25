@@ -395,7 +395,7 @@ class ModelGraph(ABC):
         self.clear_hooks()
 
         for node in self.G.nodes:
-            if node.type == NodeType.PREFIX or node.type == NodeType.SUM:
+            if node.type == NodeType.PREFIX: #or node.type == NodeType.SUM:
 
                 for succ in self.succs(node):
                     print(f"Trying {succ.layer_name} with type {succ.type}")
@@ -529,7 +529,7 @@ class Resnet(ModelGraph):
         for i in range(1, self.num_layers + 1):
             input_node = self.add_layer_nodes(self.layer_name + str(i), input_node)
 
-        input_node = self.add_nodes_from_sequence('', ['avgpool', self.head_name, NodeType.OUTPUT], input_node, sep='')
+        input_node = self.add_nodes_from_sequence('', [NodeType.PREFIX, 'avgpool', self.head_name, NodeType.OUTPUT], input_node, sep='')
 
 
         return self
@@ -760,7 +760,7 @@ if __name__ == '__main__':
 
     merges, unmerges = intermediates, intermediates
 
-    for i, node in enumerate(list(merges.keys())[:4]):
+    for i, node in enumerate(list(merges.keys())[-1:]):
         m_ = merges[node]
         u_ = unmerges[node]
         merger = MergeHandler(graph, m_, u_)
