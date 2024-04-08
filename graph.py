@@ -20,9 +20,9 @@ class CovarianceMetric():
         feats = list(feats)
         assert len(feats) == 2
         feats[1] += torch.randn_like(feats[1])
-        print(f"Feats (original) shape: {feats[0].shape}")
+        # print(f"Feats (original) shape: {feats[0].shape}")
         feats = torch.cat(feats, dim=0)
-        print(f"Feats shape: {feats.shape}")
+        # print(f"Feats shape: {feats.shape}")
         feats = torch.nan_to_num(feats, 0, 0, 0)
         
         std = feats.std(dim=1)
@@ -309,7 +309,7 @@ class Graph:
                 t = (node.name, node.name)
             if node.color is not None:
                 color = {'color': node.color, 'style': 'filled'}
-            print(f"Adding node {t} with color {color}")
+            # print(f"Adding node {t} with color {color}")
             dot.node(*t, **color)
         for n in self.edges:
             for succ in self.edges[n]:
@@ -656,7 +656,7 @@ class MergeHandler:
         if node in self.graph.merged:
             #node.color = 'blue'
             print("Collision")
-            return
+            #return
         
         #info = h.get_node_info(node)
         self.graph.merged.add(node)
@@ -690,7 +690,7 @@ class MergeHandler:
         if node in self.graph.unmerged:
             # node.color = 'blue'
             print("Collision")
-            return
+            #return
         
         #info = self.graph.get_node_info(node)
         self.graph.unmerged.add(node)
@@ -760,7 +760,7 @@ if __name__ == '__main__':
 
     merges, unmerges = intermediates, intermediates
 
-    for i, node in enumerate(list(merges.keys())[-1:]):
+    for i, node in enumerate(list(merges.keys())):
         m_ = merges[node]
         u_ = unmerges[node]
         merger = MergeHandler(graph, m_, u_)
@@ -769,6 +769,9 @@ if __name__ == '__main__':
         diagram = graph.G.draw()
         diagram.render(f'resnet50_{i}', format='png')
         graph.G.decolor()
+        print(len(graph.merged), len(graph.unmerged))
+        graph.merged.clear()
+        graph.unmerged.clear()
         
 
     

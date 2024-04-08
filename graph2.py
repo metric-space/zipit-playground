@@ -4,6 +4,8 @@ from enum import Enum
 from abc import ABC, abstractmethod
 import matplotlib.pyplot as plt
 from graphviz import Digraph
+import click
+from tqdm import tqdm
 
 
 class FeatureReshapeHandler:
@@ -68,6 +70,7 @@ class Node:
         self.chunk = chunk
         self.special_merge = special_merge
         self.color = None
+        self.traversal_number = None
 
     def __str__(self):
         return f"Node({self.name}, {self.type}, {self.layer_name}, {self.param_name}, {self.chunk}, {self.special_merge})"
@@ -108,7 +111,7 @@ class Graph:
             if node in self.edges[n]:
                 preds.append(n)
         return preds
-    
+
     def len(self):
         return len(self.nodes)
 
@@ -118,21 +121,22 @@ class Graph:
         for node in self.nodes:
             name = node.name
 
-            t = (node.name, node.layer_name)
             color = {}
             if node.type == NodeType.MODULE:
-                pass
+                t = (node.name, node.layer_name + str(node.traversal_number) or "")
             elif node.type == NodeType.PREFIX:
-                t = (node.name, "Prefix")
+                t = (node.name, "Prefix" + str(node.traversal_number) or "")
             elif node.type == NodeType.POSTFIX:
-                t = (node.name, "Postfix")
+                t = (node.name, "Postfix" + str(node.traversal_number) or "")
             elif node.type == NodeType.SUM:
-                t = (node.name, "Sum")
+                t = (node.name, "Sum" + str(node.traversal_number) or "")
             else:
                 t = (node.name, node.name)
+                if node.name and node.traversal_number:
+                    t = (node.name, node.name + str(node.traversal_number) or "")
             if node.color is not None:
                 color = {'color': node.color, 'style': 'filled'}
-            print(f"Adding node {t} with color {color}")
+            #print(f"Adding node {t} with color {color}")
             dot.node(*t, **color)
         for n in self.edges:
             for succ in self.edges[n]:
@@ -193,12 +197,25 @@ class ModelGraph(ABC):
         source = input_node
         for name in list_of_names:
             if isinstance(name, str):
-                temp_node = self.create_node(layer_name=name_prefix + sep + name)
+                if name_prefix == '':
+                    temp_node = self.create_node(layer_name=name)
+                else:
+                    temp_node = self.create_node(layer_name=name_prefix + sep + name)
             else:
                 temp_node = self.create_node(type=name)
             self.add_edge(source, temp_node)
             source = temp_node
         return source
+    
+    def get_node_info(self, name):
+        node = None
+        if isinstance(name, int):
+            name = str(name)
+        for n in self.G.nodes:
+            if n.name == name:
+                node = n
+                break
+        return node
 
     def print_prefix(self):
         for node in self.G.nodes:
@@ -209,8 +226,8 @@ class ModelGraph(ABC):
         def hook(module, input, _):
             a = FeatureReshapeHandler(module.__class__.__name__, module)
             b = a.handler(input[0])
+            print(f"Hooked {node} with shape {b.shape}")
             self.intermediates[node] = b
-            print(f"Hooked {node.name} with shape {b.shape}")
             return None
         return hook
 
@@ -219,22 +236,39 @@ class ModelGraph(ABC):
 
         for node in self.G.nodes:
             if node.type == NodeType.PREFIX: #or node.type == NodeType.SUM:
+                print(f"Adding hook for {node.layer_name or node.name}")
 
                 for succ in self.succs(node):
                     print(f"Trying {succ.layer_name} with type {succ.type}")
 
                     if succ.type == NodeType.MODULE:
+                        # succ.color = 'green'
                         # add it to the first module
                         self.hooks.append(self.named_modules[succ.layer_name].register_forward_hook(self.hook_fn(node)))
                         break
-                else:
-                    raise RuntimeError(f"Node type {node.type} not supported for prefix hooks")
+                    elif node.type == NodeType.EMBEDDING:
+                        def prehook(m, x, this_node=node, this_info=succ):
+                            tensor = self.get_parameter(this_info['param']).data
+                            tensor = tensor.flatten(0, len(x[0].shape)-2).transpose(1, 0).contiguous()
+                            print(this_node)
+                            self.intermediates[this_node.name] = tensor
+                            return None
+                    
+                        module = self.get_module(succ.layer)
+                        self.hooks.append(module.register_forward_pre_hook(prehook))
+                        break
+                    else:
+                        raise RuntimeError(f"PREFIX node {node} had no module to attach to.")
             elif node.type == NodeType.POSTFIX:
                 for pred in self.preds(node):
                     if pred.type == NodeType.MODULE:
-                        self.hooks.append(self.named_modules[pred.layer_name].register_forward_hook(self.hook_fn(pred.layer_name)))
+                        # pred.color = 'red'
+                        self.hooks.append(self.named_modules[pred.layer_name].register_forward_hook(self.hook_fn(node)))
                         break
-                raise RuntimeError(f"Node type {node.type} not supported for postfix hooks")
+                    elif node.type == NodeType.EMBEDDING:
+                        raise RuntimeError("This shouldn't be hit for any reason")
+                    else:
+                        raise RuntimeError(f"Node type {node.type} not supported for postfix hooks")
 
 
     def remove_hooks(self):
@@ -454,7 +488,7 @@ class TransformerEncoderGraph(ModelGraph):
         self.add_edge(input_node, emb_node)
 
         # removing emb_pos node for now...
-        input_node = self.add_nodes_from_sequence(self.enc_prefix, [modules['emb_ln']], emb_node) 
+        input_node = self.add_nodes_from_sequence('', [modules['emb_ln']], emb_node) 
      
         if self.merge_type in ['all', 'ff+res', 'res_only']:
             #adding postfix to emb_ln, before xformer layers
@@ -464,24 +498,29 @@ class TransformerEncoderGraph(ModelGraph):
         input_node = self.add_layer_nodes(f'{self.layer_name}', input_node, self.merge_type)
                 
         # xformer layers -> dense -> layernorm -> output
-        if self.name == 'bert' and self.classifier == False:
-            dense_node = self.add_nodes_from_sequence(modules['head_pref'], ['transform.dense', 'transform.LayerNorm', NodeType.PREFIX, 'decoder'], input_node)
-            output_node = self.create_node(type=NodeType.OUTPUT)
-            self.add_edge(dense_node, output_node)
-        elif self.name == 'bert' and self.classifier == True:
-            pool_node = self.add_nodes_from_sequence(self.enc_prefix, [modules['pooler']], input_node)
-            class_node = self.add_nodes_from_sequence('', [NodeType.PREFIX, modules['classifier']], pool_node)
-            output_node = self.create_node(type=NodeType.OUTPUT)
-            self.add_edge(class_node, output_node)
-        elif self.name == 'roberta':
-            #dense_node = self.add_nodes_from_sequence(modules['head_pref'], ['dense', NodeType.PREFIX, 'out_proj'], input_node)
-            output_node = self.create_node(type=NodeType.OUTPUT)
-            self.add_edge(input_node, output_node)       
+        #if self.name == 'bert' and self.classifier == False:
+        #    dense_node = self.add_nodes_from_sequence(modules['head_pref'], ['transform.dense', 'transform.LayerNorm', NodeType.PREFIX, 'decoder'], input_node)
+        #    output_node = self.create_node(type=NodeType.OUTPUT)
+        #    self.add_edge(dense_node, output_node)
+        #elif self.name == 'bert' and self.classifier == True:
+        #    pool_node = self.add_nodes_from_sequence(self.enc_prefix, [modules['pooler']], input_node)
+        #    class_node = self.add_nodes_from_sequence('', [NodeType.PREFIX, modules['classifier']], pool_node)
+        #    output_node = self.create_node(type=NodeType.OUTPUT)
+        #    self.add_edge(class_node, output_node)
+        #elif self.name == 'roberta':
+        #    #dense_node = self.add_nodes_from_sequence(modules['head_pref'], ['dense', NodeType.PREFIX, 'out_proj'], input_node)
+        #    output_node = self.create_node(type=NodeType.OUTPUT)
+        #    self.add_edge(input_node, output_node)       
+
+        if self.name == 'bert':
+           #dense_node = self.add_nodes_from_sequence(modules['head_pref'], ['dense', NodeType.PREFIX, 'out_proj'], input_node)
+           output_node = self.create_node(type=NodeType.OUTPUT)
+           self.add_edge(input_node, output_node)
         
         return self
 
     
-def bert(model, merge_type='ff_only', qk=False, classifier=False):
+def bert(model, merge_type='all', qk=False, classifier=False):
     modules = {'emb': 'embeddings.word_embeddings',
      'emb_pos': 'embeddings.position_embeddings',
      'emb_tok_type': 'embeddings.token_type_embeddings',
@@ -499,8 +538,8 @@ def bert(model, merge_type='ff_only', qk=False, classifier=False):
      'classifier': 'classifier'}
     return TransformerEncoderGraph(model, 
                                    modules,
-                                   layer_name='bert.encoder.layer', 
-                                   enc_prefix='bert',
+                                   layer_name='encoder.layer', 
+                                   enc_prefix='encoder',
                                    merge_type=merge_type,
                                    num_layers=12,
                                    num_heads=12,
@@ -508,8 +547,295 @@ def bert(model, merge_type='ff_only', qk=False, classifier=False):
                                    name='bert',
                                    classifier=classifier)
 
+
+def interpolate_color(start_color, end_color, steps):
+    """Interpolate colors from start to end in RGB space over a given number of steps."""
+    start_rgb = [int(start_color[i:i+2], 16) for i in (1, 3, 5)]
+    end_rgb = [int(end_color[i:i+2], 16) for i in (1, 3, 5)]
+    
+    colors = []
+    for step in range(steps):
+        interpolated = [start + (end - start) * step / (steps - 1) for start, end in zip(start_rgb, end_rgb)]
+        colors.append('#' + ''.join(f'{int(round(c)):02x}' for c in interpolated))
+    return colors
+
+# Start and end colors in hex format
+start_color_hex = "#add8e6"  # Light blue
+end_color_hex = "#0000ff" 
+
+def compute_transformations(graph, nodes, res):
+
+        merges = {}
+        unmerges = {}
+           
+
+        global_res_merge= None
+        global_res_unmerge = None
+
+        special_cases_names = ['final_ln', 'attn_ln', 'emb_ln', 'q', 'k']
+        special_cases_nodes = [graph.modules[name] for name in special_cases_names]
+        qk_nodes = [graph.modules[name] for name in ['q', 'k']]
+        print('qk nodes', qk_nodes)
+
+        cost_dict = {}
+        
+        qk_flag = False
+        if graph.qk == True:
+            qk_flag = True
+            #for i in range(graph.num_layers):
+            #    nodes.remove(f'qk{i}')
+        # nodes.sort() # what the fuck is going on here?
+        print('computing corrs')
+        # corrs = compute_metric_corrs(nodes, res=res, no_corr=no_corr, qk=qk_flag)
+
+        # save all corrs to file to look at them. 
+        # breakpoint()
+        # with open(f'corrs.pt', 'wb+') as corrs_out:
+        #     torch.save(corrs, corrs_out)
+        
+        # corrs has all nonres nodes & the one res node. Unless this is sep, then it has all nodes
+
+        for node in tqdm(nodes, desc="Computing transformations: "):
+            prev_node_layer = graph.get_node_info(int(node.name)-1).layer_name
+            # skip metrics associated with residuals and qk if qk is true
+            correlation_matrix = None
+            print(f"Print prev node layer: {prev_node_layer}")
+
+            # Boolean algebra here fucko
+            if not prev_node_layer or not any([name in prev_node_layer for name in special_cases_nodes]):
+                node.color = 'violet'
+            elif any([name in prev_node_layer for name in qk_nodes]):
+                node.color = 'black'
+            else:
+                node.color = 'blue'
+
+        return
+
+
 if __name__ == "__main__":
     model = torch.hub.load('huggingface/pytorch-transformers', 'model', 'bert-base-uncased')
-    g = bert(model, merge_type='ff_only', qk=False, classifier=False)
-    diagram = g.graphify().G.draw()
-    diagram.render('bert', format='png')
+    g = bert(model, merge_type='all', qk=True, classifier=False)
+    g = g.graphify()
+
+    g.add_hooks()
+    
+    x = torch.ones(1, 128).long()
+    # convert x to int
+    intermediates = g.compute_intermediates(x)
+    print("len intermediates", len(intermediates))
+
+    nodes = []
+
+    for k, v in intermediates.items():
+        print(f"{k} -> :{v.shape} {k.layer_name}")
+        # k.color = 'blue'
+        nodes.append(k)
+
+    def separate_res_nodes(nodes, graph):
+        resnodes = []
+        non_resnodes = []
+        for node in nodes:
+            if node.type == NodeType.POSTFIX:
+                print(f"Node: {node.name}")
+                prev_node_info = graph.get_node_info(int(node.name) - 1).layer_name
+                if (graph.modules['q'] in prev_node_info) or (graph.modules['k'] in prev_node_info):
+                    #non_resnodes.append(node) # this is a qk node
+                    continue
+                else:
+                    resnodes.append(node) # all res keys are postfixes by design
+            else:
+                non_resnodes.append(node)
+        return resnodes, non_resnodes
+
+    resnodes, non_resnodes = separate_res_nodes(nodes, g)
+    #for node in resnodes:
+    #    # node.color = 'black'
+    #    print(f"Residual node: {node}")
+
+    #for node in non_resnodes:
+    #    # node.color = 'gray'
+    #    print(f"Non-residual node: {node}")
+
+    compute_transformations(g, nodes, 'all')
+
+    ## color = interpolate_color(start_color_hex, end_color_hex, len(nodes))
+
+    ##for node, c in zip(nodes, color):
+    ##    print(node)
+    ##    node.color = c
+
+
+    # traversal code
+
+    #qk_flag = False
+
+    #for i, node in enumerate(nodes):
+    #    node.color = 'red'
+    #    node.traversal_number = i
+    #    count = 0
+    #    # gross code
+    #    preds = g.G.predecessors(node)
+    #    info = preds[0]
+    #    info.color = 'red'
+    #    info.traversal_number = i
+    #    # self attention merging, and self attention out unmerging 
+    #    if info.type == NodeType.SUM:
+    #        print(f'merging MHA : {info}')
+    #        # apply merges to k,q,v matrices
+    #        sum_preds = g.G.predecessors(preds[0])
+    #        for sum_pred in sum_preds:
+    #            sum_pred.color = 'red'
+    #        # check if q,k junction or v matrix
+    #        for sum_pred in sum_preds:
+    #            sum_pred.traversal_number = i
+    #            
+    #            info = sum_pred
+    #            if info.type == NodeType.SUM:
+    #                sum_pred.color = 'red'
+    #                if qk_flag == False:
+    #                    second_sum_preds = g.G.predecessors(sum_pred)
+    #                    # merge q & k 
+    #                    for second_sum_pred in second_sum_preds:
+    #                        second_sum_pred.color = 'red'
+    #                        second_sum_pred.traversal_number = i
+    #            elif 'v_proj' in info.layer_name or 'value' in info.layer_name:
+    #                # merge v
+    #                # do something with sum pred
+    #                # self.merge_node(sum_pred, merger)
+    #                sum_pred.color = 'green'
+    #        break
+
+    #        # color the successor node
+
+        #    succ = merger.graph.succs(node)[0]
+        #    self.unmerge_node(succ, merger)
+        #elif contains_name(info['layer'], qk_nodes) and qk_flag == True:
+        #    print('merging qk')
+        #    self.merge_node(preds[0], merger)
+
+        #elif 'self_attn_layer_norm' in info['layer'] or 'attention.output.LayerNorm' in info['layer']:
+        #    print('merging self-attn res')
+        #    # apply merge to ln
+        #    module = merger.graph.get_module(info['layer'])
+        #    parameter_names = ['weight', 'bias']
+        #    for parameter_name in parameter_names:
+        #        parameter = getattr(module, parameter_name)
+        #        parameter.data = merger.merge @ parameter
+
+        #    # apply merges to the self.attn out proj
+        #    sum = merger.graph.preds(preds[0])[0]
+        #    out_proj = merger.graph.preds(sum)[0]
+        #    self.merge_node(out_proj, merger)
+
+        #    # unmerge the ff1 module 
+        #    ff1 = merger.graph.succs(node)[0]
+        #    self.unmerge_node(ff1, merger)
+
+        #elif 'final_layer_norm' in info['layer'] or 'layernorm_embedding' in info['layer'] or 'output.LayerNorm' in info['layer'] or 'embeddings.LayerNorm' in info['layer']:
+        #    print('merging final res')
+        #    # apply merge to ln
+        #    module = merger.graph.get_module(info['layer'])
+        #    parameter_names = ['weight', 'bias']
+        #    for parameter_name in parameter_names:
+        #        parameter = getattr(module, parameter_name)
+        #        parameter.data = merger.merge @ parameter
+
+        #    sum = merger.graph.preds(preds[0])[0]
+        #    info = merger.graph.get_node_info(sum)
+        #    if info['type'] == NodeType.SUM:
+        #        ff2 = merger.graph.preds(sum)[0]
+        #        self.merge_node(ff2, merger)
+        #    else:
+        #        # this is emb node then
+        #        if final_merger == None and count == 1:
+        #            final_merger = merger
+        #        if merger.graph.enc_prefix == 'bert':
+        #            # bert has special token type embedding that must be merged too
+        #            emb_tok_suff = merger.graph.modules['emb_tok_type']
+        #            emb_tok_name = f'{merger.graph.enc_prefix}.{emb_tok_suff}'
+        #            emb_tok_mod = merger.graph.get_module(emb_tok_name)
+        #            emb_tok_mod.weight.data = (merger.merge @ (emb_tok_mod.weight).T).T 
+
+        #        # grabbing naming vars
+        #        emb_suff = merger.graph.modules['emb']
+        #        emb_pos_suff = merger.graph.modules['emb_pos']
+        #        emb_name = f'{merger.graph.enc_prefix}.{emb_suff}'
+        #        emb_pos_name = f'{merger.graph.enc_prefix}.{emb_pos_suff}'
+
+        #        # merger emb &  emb_pos
+        #        emb = merger.graph.get_module(emb_name)
+        #        emb_pos = merger.graph.get_module(emb_pos_name)
+        #        emb.weight.data = (merger.merge @ (emb.weight).T).T
+        #        emb_pos.weight.data = (merger.merge @ (emb_pos.weight).T).T 
+
+        #    # this unmerges w_k, w_q, w_v
+        #    succs = merger.graph.succs(node)
+        #    if len(succs) > 1:
+        #        for succ in succs:
+        #            info = merger.graph.get_node_info(succ)
+        #            if info['type'] != NodeType.SUM:
+        #                self.unmerge_node(succ, merger)
+        #    else:
+        #        # in this case, we have the second to last node
+        #        # separate case for mnli & camembert due to head names
+        #        # first we check if model is bert and unmerge the lm head 
+        #        if 'cls.predictions.transform.dense' in merger.graph.named_modules:
+        #            module = merger.graph.get_module('cls.predictions.transform.dense') 
+        #            module.weight.data = module.weight @ merger.unmerge
+
+        #        elif 'bert.pooler.dense' in merger.graph.named_modules:
+        #            module = merger.graph.get_module('bert.pooler.dense') 
+        #            module.weight.data = module.weight @ merger.unmerge
+        #        elif len(merger.graph.model.classification_heads.keys()) != 0:
+        #            if 'classification_heads.mnli.dense' in merger.graph.named_modules:
+        #                module = merger.graph.get_module('classification_heads.mnli.dense')
+        #                module.weight.data = module.weight @ merger.unmerge
+        #            elif 'classification_heads.sentence_classification_head.dense' in merger.graph.named_modules:
+        #                module = merger.graph.get_module('classification_heads.sentence_classification_head.dense')
+        #                module.weight.data = module.weight @ merger.unmerge
+        #        # if has no classification heads, it uses lm heads instead, and is a roberta model
+        #        # unmerge this, but in the actual eval of wsc, need to fix forward pass, but this is the minimum needed to
+        #        # store the correct weights
+        #        else:
+        #            module = merger.graph.get_module('encoder.lm_head.dense')
+        #            module.weight.data = module.weight @ merger.unmerge
+
+        ## apply merge to fc1 & unmerge fc2
+        #elif 'fc1' in info['layer'] or 'intermediate.dense' in info['layer']:
+        #    print('merging ff')
+        #    # apply merges to the fc1 layer
+        #    module = merger.graph.get_module(info['layer'])
+        #    self.merge_node(preds[0], merger)
+
+        #    # apply unmerge to fc2 layer
+        #    succ = merger.graph.succs(node)[0]
+        #    self.unmerge_node(succ, merger)
+
+        #elif 'transform.LayerNorm' in info['layer'] and merge_cls:
+        #    if final_merger == None and count == 1: # count ensures this is 2nd model merger being saved
+        #        final_merger = merger
+
+        #    print('merging lm head')
+        #    # apply merge to layernorm 
+        #    module = merger.graph.get_module(info['layer'])
+        #    parameter_names = ['weight', 'bias']
+        #    for parameter_name in parameter_names:
+        #        parameter = getattr(module, parameter_name)
+        #        parameter.data = merger.merge @ parameter
+
+        #    # merge dense
+        #    pred = merger.graph.preds(preds[0])[0]
+        #    self.merge_node(pred, merger)
+
+        #elif 'pooler' in info['layer'] and merge_cls:
+        #    print('merging class head')
+        #    # merge pooler weight
+        #    self.merge_node(preds[0], merger)
+        #    # get cls node & unmerge
+        #    succ = merger.graph.succs(node)[0]
+        #    self.unmerge_node(succ, merger)
+        #count += 1
+
+    print("Drawing graph")
+    diagram = g.G.draw()
+    diagram.render('bert_traversal', format='png')
